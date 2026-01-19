@@ -49,11 +49,17 @@ class SparseStructureVaeTrainer(BasicTrainer):
         *args,
         loss_type='bce',
         lambda_kl=1e-6,
+        lambda_dice=1.0,      # Dice损失权重（通道0）
+        lambda_ce=1.0,        # 交叉熵损失权重（通道1-7）
+        lambda_mse=1.0,       # MSE损失权重（通道8-13）
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.loss_type = loss_type
         self.lambda_kl = lambda_kl
+        self.lambda_dice = lambda_dice
+        self.lambda_ce = lambda_ce
+        self.lambda_mse = lambda_mse
     
     def training_losses(
         self,
@@ -84,6 +90,20 @@ class SparseStructureVaeTrainer(BasicTrainer):
             logits = F.sigmoid(logits)
             terms["dice"] = 1 - (2 * (logits * ss.float()).sum() + 1) / (logits.sum() + ss.float().sum() + 1)
             terms["loss"] = terms["loss"] + terms["dice"]
+        elif self.loss_type == 'composite':
+            logits_sigmoid = torch.sigmoid(logits)
+            # Dice loss for channel 0
+            dice_loss = 1 - (2 * (logits_sigmoid[:,0:1] * ss.float()[:,0:1]).sum() + 1) / (logits_sigmoid[:,0:1].sum() + ss.float()[:,0:1].sum() + 1)
+            terms["dice"] = dice_loss
+            terms["loss"] = terms["loss"] + self.lambda_dice * dice_loss
+            # Cross-entropy loss for channels 1-7
+            ce_loss = F.binary_cross_entropy_with_logits(logits[:,1:8], ss.float()[:,1:8], reduction='mean')
+            terms["ce"] = ce_loss
+            terms["loss"] = terms["loss"] + self.lambda_ce * ce_loss
+            # MSE loss for channels 8-13
+            mse_loss = F.mse_loss(logits_sigmoid[:,8:14], ss.float()[:,8:14], reduction='mean')
+            terms["mse"] = mse_loss
+            terms["loss"] = terms["loss"] + self.lambda_mse * mse_loss
         else:
             raise ValueError(f'Invalid loss type {self.loss_type}')
         terms["kl"] = 0.5 * torch.mean(mean.pow(2) + logvar.exp() - logvar - 1)

@@ -231,6 +231,9 @@ class Trainer:
         # Assign tasks
         num_samples_per_process = int(np.ceil(num_samples / self.world_size))
         samples = self.run_snapshot(num_samples_per_process, batch_size=batch_size, verbose=verbose)
+        os.makedirs(os.path.join(self.output_dir, 'samples', suffix), exist_ok=True)
+        torch.save(samples['recon']['value'],os.path.join(self.output_dir, 'samples', suffix, 'recon.pt'))
+        torch.save(samples['gt']['value'],os.path.join(self.output_dir, 'samples', suffix, 'gt.pt'))
 
         # Preprocess images
         for key in list(samples.keys()):
