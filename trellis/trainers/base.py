@@ -26,6 +26,7 @@ class Trainer:
         *,
         output_dir,
         load_dir,
+        val_dataset,
         step,
         max_steps,
         batch_size=None,
@@ -52,6 +53,7 @@ class Trainer:
 
         self.models = models
         self.dataset = dataset
+        self.val_dataset = val_dataset if val_dataset is not None else None
         self.batch_split = batch_split if batch_split is not None else 1
         self.max_steps = max_steps
         self.optimizer_config = optimizer
@@ -138,7 +140,8 @@ class Trainer:
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size_per_gpu,
-            num_workers=int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
+            # num_workers=int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
+            num_workers=16,
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
@@ -289,6 +292,14 @@ class Trainer:
             print(' Done.')
 
     @abstractmethod
+    def validate(self):
+        """
+        Validate the model.
+        NOTE: This function should be called by all processes.
+        """
+        pass
+
+    @abstractmethod
     def update_ema(self):
         """
         Update exponential moving average.
@@ -416,7 +427,7 @@ class Trainer:
                 if self.step % self.i_log == 0:
                     ## save to log file
                     log_str = '\n'.join([
-                        f'{step}: {json.dumps(log)}' for step, log in log
+                        f'{step}: {log}' for step, log in log
                     ])
                     with open(os.path.join(self.output_dir, 'log.txt'), 'a') as log_file:
                         log_file.write(log_str + '\n')
@@ -428,6 +439,12 @@ class Trainer:
                     for key, value in log_show.items():
                         self.writer.add_scalar(key, value, self.step)
                     log = []
+                    
+                    self.validate()
+                    samples = self.run_snapshot(num_samples=16, batch_size=4)
+                    train_miou = self.miou(samples['recon']['value'], samples['gt']['value'], thr=0.5)
+                    train_miou_occ = self.miou_occ(samples['recon']['value'][:, :1], samples['gt']['value'][:, :1], thr=0.5)
+                    print(f'Train mIoU: {train_miou:.6f}\nTrain mIoU_occ: {train_miou_occ:.6f}')
 
                 # Save checkpoint
                 if self.step % self.i_save == 0:
@@ -451,4 +468,11 @@ class Trainer:
             for _ in range(wait + warmup + active):
                 self.run_step()
                 prof.step()
-            
+
+    @abstractmethod    
+    def miou(self, p, t, thr=0.5):
+        pass
+
+    @abstractmethod    
+    def miou_occ(self, p, t, thr=0.5):
+        pass

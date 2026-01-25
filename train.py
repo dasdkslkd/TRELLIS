@@ -68,6 +68,9 @@ def main(local_rank, cfg):
 
     # Load data
     dataset = getattr(datasets, cfg.dataset.name)(cfg.data_dir, **cfg.dataset.args)
+    val_dataset = None
+    if cfg.val_data_dir is not None:
+        val_dataset = getattr(datasets, cfg.val_dataset.name)(cfg.val_data_dir, **cfg.val_dataset.args)
 
     # Build model
     model_dict = {
@@ -84,7 +87,7 @@ def main(local_rank, cfg):
                 print(model_summary, file=fp)
 
     # Build trainer
-    trainer = getattr(trainers, cfg.trainer.name)(model_dict, dataset, **cfg.trainer.args, output_dir=cfg.output_dir, load_dir=cfg.load_dir, step=cfg.load_ckpt)
+    trainer = getattr(trainers, cfg.trainer.name)(model_dict, dataset, **cfg.trainer.args, val_dataset=val_dataset, output_dir=cfg.output_dir, load_dir=cfg.load_dir, step=cfg.load_ckpt)
 
     # Train
     if not cfg.tryrun:
@@ -104,6 +107,7 @@ if __name__ == '__main__':
     parser.add_argument('--load_dir', type=str, default='', help='Load directory, default to output_dir')
     parser.add_argument('--ckpt', type=str, default='latest', help='Checkpoint step to resume training, default to latest')
     parser.add_argument('--data_dir', type=str, default='./data/', help='Data directory')
+    parser.add_argument('--val_data_dir', type=str, default=None, help='Validation data directory')
     parser.add_argument('--auto_retry', type=int, default=3, help='Number of retries on error')
     ## dubug
     parser.add_argument('--tryrun', action='store_true', help='Try run without training')

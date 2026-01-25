@@ -92,18 +92,33 @@ class SparseStructureVaeTrainer(BasicTrainer):
             terms["loss"] = terms["loss"] + terms["dice"]
         elif self.loss_type == 'composite':
             logits_sigmoid = torch.sigmoid(logits)
-            # Dice loss for channel 0
+
+            # Dice loss for channel 0（保持不变）
             dice_loss = 1 - (2 * (logits_sigmoid[:,0:1] * ss.float()[:,0:1]).sum() + 1) / (logits_sigmoid[:,0:1].sum() + ss.float()[:,0:1].sum() + 1)
             terms["dice"] = dice_loss
             terms["loss"] = terms["loss"] + self.lambda_dice * dice_loss
-            # Cross-entropy loss for channels 1-7
-            ce_loss = F.binary_cross_entropy_with_logits(logits[:,1:8], ss.float()[:,1:8], reduction='mean')
-            terms["ce"] = ce_loss
-            terms["loss"] = terms["loss"] + self.lambda_ce * ce_loss
-            # MSE loss for channels 8-13
-            mse_loss = F.mse_loss(logits_sigmoid[:,8:14], ss.float()[:,8:14], reduction='mean')
-            terms["mse"] = mse_loss
-            terms["loss"] = terms["loss"] + self.lambda_mse * mse_loss
+
+            # 创建mask：channel 0为1的位置
+            mask = ss[:, 0:1] == 1  # shape: (B, 1, ...)
+            if mask.sum() > 0:  # 避免全0mask导致nan
+                # Cross-entropy loss for channels 1-7
+                ce_loss = F.binary_cross_entropy_with_logits(
+                    logits[:,1:8], ss.float()[:,1:8], reduction='none'
+                )  # shape: (B, 7, ...)
+                ce_loss = (ce_loss * mask.float()).sum() / mask.sum()
+                terms["ce"] = ce_loss
+                terms["loss"] = terms["loss"] + self.lambda_ce * ce_loss
+                
+                # MSE loss for channels 8-13
+                mse_loss = F.mse_loss(
+                    logits_sigmoid[:,8:14], ss.float()[:,8:14], reduction='none'
+                )  # shape: (B, 6, ...)
+                mse_loss = (mse_loss * mask.float()).sum() / mask.sum()
+                terms["mse"] = mse_loss
+                terms["loss"] = terms["loss"] + self.lambda_mse * mse_loss
+            else:
+                terms["ce"] = torch.tensor(0.0, device=logits.device)
+                terms["mse"] = torch.tensor(0.0, device=logits.device)
         else:
             raise ValueError(f'Invalid loss type {self.loss_type}')
         terms["kl"] = 0.5 * torch.mean(mean.pow(2) + logvar.exp() - logvar - 1)
@@ -148,3 +163,66 @@ class SparseStructureVaeTrainer(BasicTrainer):
             'recon': {'value': torch.cat(recons, dim=0), 'type': 'sample'},
         }
         return sample_dict
+
+    @torch.no_grad()
+    def miou(self, pred, target, thr = 0.5):
+        """
+        计算3D稀疏体素的mIoU
+        pred: 预测 (B,8,D,H,W)
+        target: 真值 (B,8,D,H,W)
+        thr: 占用阈值
+        """
+        occ = target[:, 0] > thr  # 占用掩码
+        match = pred[:, 1:8].argmax(1) == target[:, 1:8].argmax(1)  # 类型匹配
+        return (match & occ).sum().float() / occ.sum().float().clamp(min=1)
+    
+    @torch.no_grad()
+    def miou_occ(self, p, t, thr=0.5):
+        """
+        计算占用场mIoU
+        p: 预测占用场 (B, 1, D, H, W) 或 (B, D, H, W)
+        t: 真值占用场 (B, 1, D, H, W) 或 (B, D, H, W)
+        """
+        p, t = (p > thr).flatten(1), (t > thr).flatten(1)  # (B, N)
+        inter = (p & t).sum(1).float()
+        union = (p | t).sum(1).float()
+        return (inter / (union + 1e-8)).mean().item()
+    
+    @torch.no_grad()
+    def validate(self):
+        """
+        Validate the model.
+        """
+        if self.val_dataset is None:
+            return {}
+        for model in self.models.values():
+            model.eval()
+        dataloader = DataLoader(
+            copy.deepcopy(self.val_dataset),
+            batch_size=self.batch_size_per_gpu,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=self.val_dataset.collate_fn if hasattr(self.val_dataset, 'collate_fn') else None,
+        )
+
+        total_miou = 0.0
+        total_miou_occ = 0.0
+        num_batches = 0
+        for data in dataloader:
+            args = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+            z = self.models['encoder'](args['ss'].float(), sample_posterior=False)
+            logits = self.models['decoder'](z)
+            preds = torch.sigmoid(logits)
+            batch_miou = self.miou(preds, args['ss'], thr=0.5)
+            batch_miou_occ = self.miou_occ(preds[:, :1], args['ss'][:, :1], thr=0.5)
+            total_miou += batch_miou
+            total_miou_occ += batch_miou_occ
+            num_batches += 1
+
+        avg_miou = total_miou / num_batches
+        avg_miou_occ = total_miou_occ / num_batches
+        if self.is_master:
+            print(f'Validation mIoU: {avg_miou:.4f}\nValidation mIoU_occ: {avg_miou_occ:.4f}')
+        for model in self.models.values():
+            model.train()
+        return {'miou': avg_miou, 'miou_occ': avg_miou_occ}
