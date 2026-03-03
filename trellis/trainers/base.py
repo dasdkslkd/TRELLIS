@@ -233,10 +233,18 @@ class Trainer:
 
         # Assign tasks
         num_samples_per_process = int(np.ceil(num_samples / self.world_size))
-        samples = self.run_snapshot(num_samples_per_process, batch_size=batch_size, verbose=verbose)
+        samples:dict = self.run_snapshot(num_samples_per_process, batch_size=batch_size, verbose=verbose)
         os.makedirs(os.path.join(self.output_dir, 'samples', suffix), exist_ok=True)
-        torch.save(samples['recon']['value'],os.path.join(self.output_dir, 'samples', suffix, 'recon.pt'))
-        torch.save(samples['gt']['value'],os.path.join(self.output_dir, 'samples', suffix, 'gt.pt'))
+        
+        # Save raw samples (support different key names)
+        if 'recon' in samples:
+            torch.save(samples['recon']['value'], os.path.join(self.output_dir, 'samples', suffix, 'recon.pt'))
+        elif 'sample' in samples:
+            torch.save(samples['sample']['value'], os.path.join(self.output_dir, 'samples', suffix, 'recon.pt'))
+        if 'gt' in samples:
+            torch.save(samples['gt']['value'], os.path.join(self.output_dir, 'samples', suffix, 'gt.pt'))
+        elif 'sample_gt' in samples:
+            torch.save(samples['sample_gt']['value'], os.path.join(self.output_dir, 'samples', suffix, 'gt.pt'))
 
         # Preprocess images
         for key in list(samples.keys()):
@@ -393,6 +401,14 @@ class Trainer:
                     f'Speed: {speed:.2f} steps/h',
                     f'ETA: {(self.max_steps - self.step) / speed:.2f} h',
                 ]
+                # Print loss information
+                if step_log is not None and 'loss' in step_log:
+                    loss_info = step_log['loss']
+                    if isinstance(loss_info, dict):
+                        loss_str = ', '.join([f'{k}: {v:.6f}' for k, v in loss_info.items() if not k.startswith('bin_')])
+                        columns.append(f'Loss: {{{loss_str}}}')
+                    else:
+                        columns.append(f'Loss: {loss_info:.6f}')
                 print(' | '.join([c.ljust(25) for c in columns]), flush=True)
                 time_last_print = time_elapsed
 
@@ -441,10 +457,11 @@ class Trainer:
                     log = []
                     
                     self.validate()
-                    samples = self.run_snapshot(num_samples=16, batch_size=4)
-                    train_miou = self.miou(samples['recon']['value'], samples['gt']['value'], thr=0.5)
-                    train_miou_occ = self.miou_occ(samples['recon']['value'][:, :1], samples['gt']['value'][:, :1], thr=0.5)
-                    print(f'Train mIoU: {train_miou:.6f}\nTrain mIoU_occ: {train_miou_occ:.6f}')
+                    samples:dict = self.run_snapshot(num_samples=16, batch_size=4)
+                    if 'recon' in samples:
+                        train_miou = self.miou(samples['recon']['value'], samples['gt']['value'], thr=0.5)
+                        train_miou_occ = self.miou_occ(samples['recon']['value'][:, :1], samples['gt']['value'][:, :1], thr=0.5)
+                        print(f'Train mIoU: {train_miou:.6f}\nTrain mIoU_occ: {train_miou_occ:.6f}')
 
                 # Save checkpoint
                 if self.step % self.i_save == 0:

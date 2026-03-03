@@ -1,0 +1,95 @@
+{
+    "_comment": "Two-Stage Sparse Structure VAE - Phase 2 (Stage 2 Only)",
+    "_description": "Freeze encoder + stage1 decoder, train stage2 decoder only. Use finetune_ckpt to load phase1 weights. Reconstructs channels 8-82 (25 sample points × 3D coords).",
+    "models": {
+        "encoder": {
+            "name": "SparseStructureEncoder",
+            "args": {
+                "in_channels": 83,
+                "latent_channels": 8,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [32, 128, 512],
+                "use_fp16": false
+            }
+        },
+        "decoder_stage1": {
+            "name": "SparseStructureDecoder",
+            "args": {
+                "out_channels": 8,
+                "latent_channels": 8,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [512, 128, 32],
+                "use_fp16": false
+            }
+        },
+        "decoder_stage2": {
+            "name": "SparseStructureCondDecoder",
+            "args": {
+                "out_channels": 75,
+                "latent_channels": 8,
+                "cond_channels": 8,
+                "cond_latent_channels": 32,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [512, 128, 32],
+                "use_fp16": false
+            }
+        }
+    },
+    "dataset": {
+        "name": "CustomSparseStructure",
+        "args": {
+            "resolution": 64
+        }
+    },
+    "val_dataset": {
+        "name": "CustomSparseStructure",
+        "args": {
+            "resolution": 64
+        }
+    },
+    "trainer": {
+        "name": "TwoStageSparseStructureVaeTrainer",
+        "args": {
+            "training_mode": "stage2",
+            "stage1_channels": 8,
+            "stage2_channels": 75,
+            "lambda_dice": 1.0,
+            "lambda_ce": 1.0,
+            "lambda_mse": 1.0,
+            "lambda_kl": 0.001,
+            "detach_stage1_for_stage2": false,
+            "stage2_cond_source": "predicted",
+            "max_steps": 60000,
+            "batch_size_per_gpu": 1,
+            "batch_split": 1,
+            "finetune_ckpt": {
+                "_comment": "Replace paths with your Phase 1 checkpoint paths",
+                "encoder": "output/two_stage_phase1/ckpts/encoder_ema0.9999_step0060000.pt",
+                "decoder_stage1": "output/two_stage_phase1/ckpts/decoder_stage1_ema0.9999_step0060000.pt"
+            },
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 5e-4,
+                    "weight_decay": 0.0
+                }
+            },
+            "ema_rate": [0.9999],
+            "fp16_mode": null,
+            "fp16_scale_growth": 0.001,
+            "grad_clip": {
+                "name": "AdaptiveGradClipper",
+                "args": {
+                    "max_norm": 1.0,
+                    "clip_percentile": 95
+                }
+            },
+            "i_log": 500,
+            "i_sample": 1000,
+            "i_save": 1000
+        }
+    }
+}

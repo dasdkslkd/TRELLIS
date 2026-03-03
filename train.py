@@ -70,7 +70,9 @@ def main(local_rank, cfg):
     dataset = getattr(datasets, cfg.dataset.name)(cfg.data_dir, **cfg.dataset.args)
     val_dataset = None
     if cfg.val_data_dir is not None:
-        val_dataset = getattr(datasets, cfg.val_dataset.name)(cfg.val_data_dir, **cfg.val_dataset.args)
+        # Use val_dataset config if provided, otherwise use same config as training dataset
+        val_dataset_cfg = cfg.get('val_dataset', cfg.dataset)
+        val_dataset = getattr(datasets, val_dataset_cfg.name)(cfg.val_data_dir, **val_dataset_cfg.args)
 
     # Build model
     model_dict = {
@@ -148,6 +150,7 @@ if __name__ == '__main__':
         else:
             main(0, cfg)
     else:
+        import traceback
         for rty in range(cfg.auto_retry):
             try:
                 cfg = find_ckpt(cfg)
@@ -158,5 +161,7 @@ if __name__ == '__main__':
                 break
             except Exception as e:
                 print(f'Error: {e}')
+                print('Full traceback:')
+                traceback.print_exc()
                 print(f'Retrying ({rty + 1}/{cfg.auto_retry})...')
             

@@ -1,9 +1,11 @@
 import os
-from typing import Union, Dict, Any
+import json
+from typing import Union, Dict, Any, Optional
 import torch
 import numpy as np
 import pandas as pd
-from .components import StandardDatasetBase
+from PIL import Image
+from .components import StandardDatasetBase, TextConditionedMixin, ImageConditionedMixin
 from ..representations.octree import DfsOctree as Octree
 from ..renderers import OctreeRenderer
 import utils3d
@@ -331,3 +333,319 @@ class SimpleSparseStructureDataset(torch.utils.data.Dataset):
 
 
 
+
+# ==================== Latent Dataset for Flow Matching Training ====================
+
+class CustomSparseStructureLatent(StandardDatasetBase):
+    """
+    Custom sparse structure latent dataset for flow matching training.
+    
+    This dataset loads pre-encoded latent representations instead of raw sparse structures,
+    which is much more efficient for training flow matching models.
+    
+    Dataset structure:
+        root/
+            metadata.csv (contains sha256 column)
+            ss_latents/{latent_model}/
+                {sha256}.npz (contains 'mean' array for latent code)
+    
+    Args:
+        roots (str): Dataset root paths (comma-separated for multiple datasets)
+        latent_model (str): Name of the latent encoder model used (e.g., 'ss_enc_conv3d_16l8_fp16')
+        normalization (dict, optional): Normalization statistics {'mean': [...], 'std': [...]}
+            If provided, latents will be normalized: z_normalized = (z - mean) / std
+    """
+    
+    # Flag to indicate this dataset returns latents, not images
+    is_latent_dataset = True
+    
+    def __init__(
+        self,
+        roots: str,
+        *,
+        latent_model: str,
+        normalization: Optional[dict] = None,
+    ):
+        self.latent_model = latent_model
+        self.normalization = normalization
+        self.value_range = (0, 1)
+        
+        super().__init__(roots)
+        
+        # Setup loads for balanced sampling
+        # If metadata has 'num_voxels' column, use it; otherwise use uniform load
+        if 'num_voxels' in self.metadata.columns:
+            self.loads = [self.metadata.loc[sha256, 'num_voxels'] for _, sha256 in self.instances]
+        else:
+            # Use uniform load (assumes all samples have similar complexity)
+            self.loads = [1.0] * len(self.instances)
+        
+        # Setup normalization if provided
+        if self.normalization is not None:
+            self.mean = torch.tensor(self.normalization['mean']).reshape(-1, 1, 1, 1)
+            self.std = torch.tensor(self.normalization['std']).reshape(-1, 1, 1, 1)
+    
+    def filter_metadata(self, metadata: pd.DataFrame):
+        """Filter metadata to only include instances with latent encodings."""
+        stats = {}
+        # Check if latent column exists
+        latent_col = f'ss_latent_{self.latent_model}'
+        if latent_col in metadata.columns:
+            metadata = metadata[metadata[latent_col]]
+            stats[f'With {self.latent_model} latents'] = len(metadata)
+        else:
+            stats['Warning: No latent column found, using all data'] = len(metadata)
+        return metadata, stats
+    
+    def get_instance(self, root: str, instance: str) -> Dict[str, Any]:
+        """
+        Load a single latent instance.
+        
+        Args:
+            root: Dataset root directory
+            instance: Instance ID (sha256)
+            
+        Returns:
+            Dictionary containing 'x_0': latent tensor of shape [C, H, W, D]
+        """
+        latent_path = os.path.join(root, 'ss_latents', self.latent_model, f'{instance}.npz')
+        
+        if not os.path.exists(latent_path):
+            raise FileNotFoundError(f"Latent file not found: {latent_path}")
+        
+        # Load latent
+        latent = np.load(latent_path)
+        z = torch.tensor(latent['mean']).float()
+        
+        # Apply normalization if configured
+        if self.normalization is not None:
+            z = (z - self.mean) / self.std
+        
+        return {'x_0': z}
+    
+    @staticmethod
+    def collate_fn(batch, split_size=None):
+        """
+        Collate function for dense latent tensors.
+        
+        Args:
+            batch: List of dictionaries containing 'x_0' tensors
+            split_size: If specified, split batch into sub-batches (for gradient accumulation)
+        
+        Returns:
+            Dictionary or list of dictionaries with batched data
+        """
+        if split_size is None:
+            # No splitting, return single batch
+            pack = {}
+            pack['x_0'] = torch.stack([b['x_0'] for b in batch])
+            
+            # Collate other keys if present
+            keys = [k for k in batch[0].keys() if k != 'x_0']
+            for k in keys:
+                if isinstance(batch[0][k], torch.Tensor):
+                    pack[k] = torch.stack([b[k] for b in batch])
+                elif isinstance(batch[0][k], list):
+                    pack[k] = sum([b[k] for b in batch], [])
+                else:
+                    pack[k] = [b[k] for b in batch]
+            
+            return pack
+        else:
+            # Split into sub-batches for gradient accumulation
+            from ...utils.data_utils import load_balanced_group_indices
+            
+            # Use uniform load for dense tensors (all same size)
+            loads = [1] * len(batch)
+            group_idx = load_balanced_group_indices(loads, split_size)
+            
+            packs = []
+            for group in group_idx:
+                sub_batch = [batch[i] for i in group]
+                pack = {}
+                pack['x_0'] = torch.stack([b['x_0'] for b in sub_batch])
+                
+                # Collate other keys
+                keys = [k for k in sub_batch[0].keys() if k != 'x_0']
+                for k in keys:
+                    if isinstance(sub_batch[0][k], torch.Tensor):
+                        pack[k] = torch.stack([b[k] for b in sub_batch])
+                    elif isinstance(sub_batch[0][k], list):
+                        pack[k] = sum([b[k] for b in sub_batch], [])
+                    else:
+                        pack[k] = [b[k] for b in sub_batch]
+                
+                packs.append(pack)
+            
+            return packs
+
+    @torch.no_grad()
+    def visualize_sample(self, sample: dict):
+        """
+        Visualize latent samples by showing slices of the latent tensor.
+        
+        Since latent representations are 4D (C, H, W, D), we visualize them by:
+        1. Taking a middle slice along the depth dimension
+        2. Displaying multiple channels as grayscale images
+        
+        Args:
+            sample: Dictionary containing 'x_0' tensor of shape [B, C, H, W, D]
+            
+        Returns:
+            Visualization tensor of shape [B, 3, H, W] suitable for save_image
+        """
+        x_0 = sample['x_0'] if isinstance(sample, dict) else sample
+        
+        # x_0 shape: [B, C, H, W, D] (e.g., [16, 8, 16, 16, 16])
+        B, C, H, W, D = x_0.shape
+        
+        # Take middle slice along depth dimension
+        mid_slice = x_0[:, :, :, :, D // 2]  # [B, C, H, W]
+        
+        # For visualization, take first 3 channels or repeat if less than 3
+        if C >= 3:
+            vis = mid_slice[:, :3, :, :]  # [B, 3, H, W]
+        else:
+            # Repeat the first channel to create RGB
+            vis = mid_slice[:, 0:1, :, :].repeat(1, 3, 1, 1)  # [B, 3, H, W]
+        
+        # Normalize to [0, 1] for visualization
+        vis = vis - vis.min()
+        if vis.max() > 0:
+            vis = vis / vis.max()
+        
+        return vis
+
+
+class TextConditionedCustomSparseStructureLatent(TextConditionedMixin, CustomSparseStructureLatent):
+    """
+    Text-conditioned custom sparse structure latent dataset.
+    
+    Requires 'captions' column in metadata.csv containing JSON-formatted caption lists.
+    """
+    pass
+
+
+class ImageConditionedCustomSparseStructureLatent(ImageConditionedMixin, CustomSparseStructureLatent):
+    """
+    Image-conditioned custom sparse structure latent dataset.
+    
+    Requires rendered condition images and 'cond_rendered' column in metadata.csv.
+    """
+    pass
+
+
+# ==================== Pseudo-Color Image Conditioned ====================
+
+# 8类伪颜色映射 (对应通道1-8的one-hot编码)
+PSEUDO_COLORS = torch.tensor([
+    [0.12, 0.47, 0.71],  # 类别0: 蓝色
+    [1.00, 0.50, 0.05],  # 类别1: 橙色
+    [0.17, 0.63, 0.17],  # 类别2: 绿色
+    [0.84, 0.15, 0.16],  # 类别3: 红色
+    [0.58, 0.40, 0.74],  # 类别4: 紫色
+    [0.55, 0.34, 0.29],  # 类别5: 棕色
+    [0.89, 0.47, 0.76],  # 类别6: 粉色
+    [0.50, 0.50, 0.50],  # 类别7: 灰色
+], dtype=torch.float32)
+
+
+class PseudoColorImageConditionedMixin:
+    """
+    用于 custom_sparse_structure 的伪颜色图像条件 Mixin。
+    
+    每个活跃体素的伪颜色由数据的第 1-8 通道的 one-hot 编码决定。
+    训练时从 renders_cond/ 加载预渲染的伪颜色图像作为条件输入，
+    由训练器的 ImageConditionedMixin 使用 DINOv2 编码为特征。
+    
+    数据集目录结构:
+        root/
+            metadata.csv  (需要 cond_rendered 列)
+            ss_latents/{latent_model}/
+            renders_cond/{sha256}/
+                0000.png, 0001.png, ...
+                transforms.json
+    
+    Args:
+        image_size: 输入图像大小（默认518，DINOv2输入尺寸）
+    """
+    
+    def __init__(self, roots, *, image_size=518, **kwargs):
+        self.image_size = image_size
+        super().__init__(roots, **kwargs)
+    
+    def filter_metadata(self, metadata):
+        metadata, stats = super().filter_metadata(metadata)
+        if 'cond_rendered' in metadata.columns:
+            metadata = metadata[metadata['cond_rendered'] == True]
+            stats['With cond rendered'] = len(metadata)
+        return metadata, stats
+    
+    def get_instance(self, root, instance):
+        pack = super().get_instance(root, instance)
+        
+        # 加载条件渲染图像
+        image_root = os.path.join(root, 'renders_cond', instance)
+        with open(os.path.join(image_root, 'transforms.json')) as f:
+            metadata = json.load(f)
+        
+        n_views = len(metadata['frames'])
+        view = np.random.randint(n_views)
+        frame_meta = metadata['frames'][view]
+        
+        image_path = os.path.join(image_root, frame_meta['file_path'])
+        image = Image.open(image_path)
+        
+        # 基于 alpha 通道裁剪到目标区域
+        if image.mode == 'RGBA':
+            alpha = np.array(image.getchannel(3))
+            bbox_yx = np.array(alpha > 0).nonzero()
+            if len(bbox_yx[0]) > 0:
+                y_min, y_max = bbox_yx[0].min(), bbox_yx[0].max()
+                x_min, x_max = bbox_yx[1].min(), bbox_yx[1].max()
+                center = ((x_min + x_max) / 2, (y_min + y_max) / 2)
+                hsize = max(x_max - x_min, y_max - y_min) / 2
+                aug_hsize = hsize * 1.2
+                crop_box = (
+                    int(center[0] - aug_hsize),
+                    int(center[1] - aug_hsize),
+                    int(center[0] + aug_hsize),
+                    int(center[1] + aug_hsize),
+                )
+                image = image.crop(crop_box)
+        
+        image = image.resize((self.image_size, self.image_size), Image.Resampling.LANCZOS)
+        
+        if image.mode == 'RGBA':
+            alpha_ch = image.getchannel(3)
+            image = image.convert('RGB')
+            alpha_t = torch.tensor(np.array(alpha_ch)).float() / 255.0
+        else:
+            image = image.convert('RGB')
+            alpha_t = torch.ones(self.image_size, self.image_size)
+        
+        image_t = torch.tensor(np.array(image)).permute(2, 0, 1).float() / 255.0
+        # 白色背景合成
+        image_t = image_t * alpha_t.unsqueeze(0) + (1.0 - alpha_t.unsqueeze(0))
+        
+        pack['cond'] = image_t
+        return pack
+
+
+class PseudoColorImageConditionedCustomSparseStructureLatent(
+    PseudoColorImageConditionedMixin,
+    CustomSparseStructureLatent,
+):
+    """
+    伪颜色图像条件的 custom sparse structure latent 数据集。
+    
+    组合:
+      - PseudoColorImageConditionedMixin: 加载伪颜色渲染图像作为条件
+      - CustomSparseStructureLatent: 加载 VAE 编码后的 latent 作为训练目标
+    
+    完整使用流程:
+      1. dataset_toolkits/render_cond_ss.py 渲染伪颜色条件图像
+      2. 使用本数据集 + ImageConditionedFlowMatchingCFGTrainer 训练
+      3. infer.py img_cond_gen 进行推理
+    """
+    pass

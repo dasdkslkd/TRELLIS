@@ -199,7 +199,7 @@ class SparseFlowMatchingCFGTrainer(ClassifierFreeGuidanceMixin, SparseFlowMatchi
         i_save (int): Save interval.
         i_ddpcheck (int): DDP check interval.
 
-        t_schedule (dict): Time schedule for flow matching.
+         (dict): Time schedule for flow matching.
         sigma_min (float): Minimum noise level.
         p_uncond (float): Probability of dropping conditions.
     """

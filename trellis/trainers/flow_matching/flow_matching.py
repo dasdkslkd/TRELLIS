@@ -103,13 +103,13 @@ class FlowMatchingTrainer(BasicTrainer):
         """
         return (1 - self.sigma_min) * noise - x_0
 
-    def get_cond(self, cond, **kwargs):
+    def get_cond(self, cond=None, **kwargs):
         """
         Get the conditioning data.
         """
         return cond
     
-    def get_inference_cond(self, cond, **kwargs):
+    def get_inference_cond(self, cond=None, **kwargs):
         """
         Get the conditioning data for inference.
         """
@@ -137,6 +137,25 @@ class FlowMatchingTrainer(BasicTrainer):
             mean = self.t_schedule['args']['mean']
             std = self.t_schedule['args']['std']
             t = torch.sigmoid(torch.randn(batch_size) * std + mean)
+        elif self.t_schedule['name'] == 'mixed':
+            # 双模态分布：80% 中间区域，20% 噪声区域
+            mix_ratio = 0.8
+            n_middle = int(batch_size * mix_ratio)
+            n_noise = batch_size - n_middle
+            
+            # 模式1：中间区域 (mean=0.5, std=1.4) - 学习细节变换
+            middle_mean = 0.5
+            middle_std = 1.4
+            t_middle = torch.sigmoid(torch.randn(n_middle) * middle_std + middle_mean)
+            
+            # 模式2：偏向 t=0 (mean=-3.0, std=1.0) - 学习结构生成
+            noise_mean = -3.0
+            noise_std = 1.0
+            t_noise = torch.sigmoid(torch.randn(n_noise) * noise_std + noise_mean)
+            
+            # 合并并打乱
+            t = torch.cat([t_middle, t_noise])
+            t = t[torch.randperm(batch_size)]
         else:
             raise ValueError(f"Unknown t_schedule: {self.t_schedule['name']}")
         return t
@@ -170,6 +189,28 @@ class FlowMatchingTrainer(BasicTrainer):
         terms = edict()
         terms["mse"] = F.mse_loss(pred, target)
         terms["loss"] = terms["mse"]
+
+        # ===== 自洽性损失（关键添加）=====
+        # 10%概率添加自洽性训练
+        import random
+        if random.random() < 0.1 and t.max() < 0.9:  # 避免t太大时数值不稳定
+            with torch.no_grad():
+                # 前进一步（使用当前模型预测）
+                dt = 0.1
+                x_t_next = x_t + pred * dt  # Euler步进
+                t_next = torch.clamp(t + dt, max=0.99)
+            
+            # 在t_next处再次预测
+            pred_v_next = self.training_models['denoiser'](x_t_next, t_next * 1000, cond, **kwargs)
+            
+            # 计算应该到达的x_0（从t和t_next应该一致）
+            x_0_from_t = x_t - pred * t.view(-1, 1, 1, 1)
+            x_0_from_next = x_t_next - pred_v_next * t_next.view(-1, 1, 1, 1)
+            
+            # 自洽性：两个路径应该到达相同的x_0
+            terms["consistency"] = F.mse_loss(x_0_from_t, x_0_from_next) * 0.1
+        
+        terms["loss"] = terms["mse"] + terms.get("consistency", 0)
 
         # log loss with time bins
         mse_per_instance = np.array([
@@ -216,7 +257,7 @@ class FlowMatchingTrainer(BasicTrainer):
                 self.models['denoiser'],
                 noise=noise,
                 **args,
-                steps=50, cfg_strength=3.0, verbose=verbose,
+                steps=50, verbose=verbose,
             )
             sample.append(res.samples)
 
@@ -232,6 +273,84 @@ class FlowMatchingTrainer(BasicTrainer):
         }))
         
         return sample_dict
+
+    @torch.no_grad()
+    def validate(self):
+        """
+        Validate the model on validation dataset.
+        Computes average MSE loss over the validation set.
+        
+        Returns:
+            Dictionary containing validation metrics.
+        """
+        if self.val_dataset is None:
+            return {}
+        
+        # Set models to eval mode
+        for model in self.models.values():
+            model.eval()
+        
+        dataloader = DataLoader(
+            copy.deepcopy(self.val_dataset),
+            batch_size=self.batch_size_per_gpu,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=self.val_dataset.collate_fn if hasattr(self.val_dataset, 'collate_fn') else None,
+        )
+        
+        total_mse = 0.0
+        num_batches = 0
+        
+        for data in dataloader:
+            # Move data to GPU
+            data = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+            
+            x_0 = data['x_0']
+            noise = torch.randn_like(x_0)
+            # Use uniform timesteps for validation
+            t = torch.rand(x_0.shape[0]).to(x_0.device).float()
+            x_t = self.diffuse(x_0, t, noise=noise)
+            
+            # Get condition if present
+            cond_data = {k: v for k, v in data.items() if k != 'x_0'}
+            cond = self.get_cond(**cond_data)
+            
+            # Forward pass with evaluation model (not training_models)
+            pred = self.models['denoiser'](x_t, t * 1000, cond, **cond_data)
+            target = self.get_v(x_0, noise, t)
+            
+            # Compute MSE
+            batch_mse = F.mse_loss(pred, target).item()
+            total_mse += batch_mse
+            num_batches += 1
+        
+        avg_mse = total_mse / max(num_batches, 1)
+        
+        # Log validation metrics
+        if self.is_master:
+            print(f'Validation MSE: {avg_mse:.6f}')
+            self.writer.add_scalar('val/mse', avg_mse, self.step)
+        
+        # Set models back to train mode
+        for model in self.models.values():
+            model.train()
+        
+        return {'val_mse': avg_mse}
+    
+    def miou(self, p, t, thr=0.5):
+        """
+        Compute mean IoU for flow matching outputs.
+        For flow matching, we use negative MSE as a proxy metric
+        (since higher is better for IoU, but lower is better for MSE).
+        """
+        return -F.mse_loss(p, t).item()
+    
+    def miou_occ(self, p, t, thr=0.5):
+        """
+        Compute occupancy mean IoU for flow matching outputs.
+        For flow matching, we use negative MSE as a proxy metric.
+        """
+        return -F.mse_loss(p, t).item()
 
     
 class FlowMatchingCFGTrainer(ClassifierFreeGuidanceMixin, FlowMatchingTrainer):

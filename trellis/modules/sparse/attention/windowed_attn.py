@@ -8,8 +8,37 @@ if ATTN == 'xformers':
     import xformers.ops as xops
 elif ATTN == 'flash_attn':
     import flash_attn
+elif ATTN == 'sdpa':
+    from torch.nn.functional import scaled_dot_product_attention as sdpa
+elif ATTN == 'naive':
+    pass
 else:
     raise ValueError(f"Unknown attention module: {ATTN}")
+
+
+def _naive_sdpa(q, k, v):
+    """
+    Naive implementation of scaled dot product attention.
+    q, k, v: [B, N, H, C] or [N, H, C]
+    """
+    if len(q.shape) == 3:
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        squeeze = True
+    else:
+        squeeze = False
+    q = q.permute(0, 2, 1, 3)   # [B, H, N, C]
+    k = k.permute(0, 2, 1, 3)   # [B, H, N, C]
+    v = v.permute(0, 2, 1, 3)   # [B, H, N, C]
+    scale_factor = 1 / math.sqrt(q.size(-1))
+    attn_weight = q @ k.transpose(-2, -1) * scale_factor
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    out = attn_weight @ v
+    out = out.permute(0, 2, 1, 3)   # [B, N, H, C]
+    if squeeze:
+        out = out.squeeze(0)
+    return out
 
 
 __all__ = [
@@ -110,6 +139,16 @@ def sparse_windowed_scaled_dot_product_self_attention(
             out = xops.memory_efficient_attention(q, k, v)          # [B, N, H, C]
         elif ATTN == 'flash_attn':
             out = flash_attn.flash_attn_qkvpacked_func(qkv_feats)   # [B, N, H, C]
+        elif ATTN == 'sdpa':
+            q, k, v = qkv_feats.unbind(dim=2)                       # [B, N, H, C]
+            q = q.permute(0, 2, 1, 3)                               # [B, H, N, C]
+            k = k.permute(0, 2, 1, 3)                               # [B, H, N, C]
+            v = v.permute(0, 2, 1, 3)                               # [B, H, N, C]
+            out = sdpa(q, k, v)                                     # [B, H, N, C]
+            out = out.permute(0, 2, 1, 3)                           # [B, N, H, C]
+        elif ATTN == 'naive':
+            q, k, v = qkv_feats.unbind(dim=2)                       # [B, N, H, C]
+            out = _naive_sdpa(q, k, v)                              # [B, N, H, C]
         else:
             raise ValueError(f"Unknown attention module: {ATTN}")
         out = out.reshape(B * N, H, C)                              # [M, H, C]
@@ -125,6 +164,28 @@ def sparse_windowed_scaled_dot_product_self_attention(
             cu_seqlens = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(seq_lens), dim=0)], dim=0) \
                         .to(qkv.device).int()
             out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv_feats, cu_seqlens, max(seq_lens)) # [M, H, C]
+        elif ATTN == 'sdpa' or ATTN == 'naive':
+            # For variable length sequences, we need to handle each sequence separately
+            q, k, v = qkv_feats.unbind(dim=1)                       # [M, H, C]
+            out = torch.zeros_like(q)                               # [M, H, C]
+            start = 0
+            for seq_len in seq_lens:
+                end = start + seq_len
+                q_seq = q[start:end]                                # [seq_len, H, C]
+                k_seq = k[start:end]                                # [seq_len, H, C]
+                v_seq = v[start:end]                                # [seq_len, H, C]
+                if ATTN == 'sdpa':
+                    q_seq = q_seq.permute(1, 0, 2).unsqueeze(0)     # [1, H, seq_len, C]
+                    k_seq = k_seq.permute(1, 0, 2).unsqueeze(0)     # [1, H, seq_len, C]
+                    v_seq = v_seq.permute(1, 0, 2).unsqueeze(0)     # [1, H, seq_len, C]
+                    out_seq = sdpa(q_seq, k_seq, v_seq)             # [1, H, seq_len, C]
+                    out_seq = out_seq.squeeze(0).permute(1, 0, 2)   # [seq_len, H, C]
+                else:  # naive
+                    out_seq = _naive_sdpa(q_seq, k_seq, v_seq)      # [seq_len, H, C]
+                out[start:end] = out_seq
+                start = end
+        else:
+            raise ValueError(f"Unknown attention module: {ATTN}")
 
     out = out[bwd_indices]      # [T, H, C]
 

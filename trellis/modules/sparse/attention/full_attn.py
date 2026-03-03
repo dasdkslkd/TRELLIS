@@ -1,5 +1,6 @@
 from typing import *
 import torch
+import math
 from .. import SparseTensor
 from .. import DEBUG, ATTN
 
@@ -7,8 +8,45 @@ if ATTN == 'xformers':
     import xformers.ops as xops
 elif ATTN == 'flash_attn':
     import flash_attn
+elif ATTN == 'sdpa':
+    from torch.nn.functional import scaled_dot_product_attention as sdpa
+elif ATTN == 'naive':
+    pass
 else:
     raise ValueError(f"Unknown attention module: {ATTN}")
+
+
+def _naive_sdpa_varlen(q, k, v, q_seqlen, kv_seqlen):
+    """
+    Naive implementation of scaled dot product attention for variable length sequences.
+    q: [T_Q, H, C], k: [T_KV, H, C], v: [T_KV, H, Co]
+    """
+    outputs = []
+    q_offset = 0
+    kv_offset = 0
+    for i in range(len(q_seqlen)):
+        q_len = q_seqlen[i]
+        kv_len = kv_seqlen[i]
+        q_seq = q[q_offset:q_offset + q_len]           # [q_len, H, C]
+        k_seq = k[kv_offset:kv_offset + kv_len]        # [kv_len, H, C]
+        v_seq = v[kv_offset:kv_offset + kv_len]        # [kv_len, H, Co]
+        
+        # [H, q_len, C] @ [H, C, kv_len] -> [H, q_len, kv_len]
+        q_t = q_seq.permute(1, 0, 2)                    # [H, q_len, C]
+        k_t = k_seq.permute(1, 2, 0)                    # [H, C, kv_len]
+        v_t = v_seq.permute(1, 0, 2)                    # [H, kv_len, Co]
+        
+        scale_factor = 1 / math.sqrt(q_t.size(-1))
+        attn_weight = q_t @ k_t * scale_factor          # [H, q_len, kv_len]
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+        out = attn_weight @ v_t                         # [H, q_len, Co]
+        out = out.permute(1, 0, 2)                      # [q_len, H, Co]
+        outputs.append(out)
+        
+        q_offset += q_len
+        kv_offset += kv_len
+    
+    return torch.cat(outputs, dim=0)
 
 
 __all__ = [
@@ -206,6 +244,30 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
         elif num_all_args == 3:
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+    elif ATTN == 'sdpa' or ATTN == 'naive':
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        if ATTN == 'sdpa':
+            # Process each sequence separately for variable length
+            outputs = []
+            q_offset = 0
+            kv_offset = 0
+            for i in range(len(q_seqlen)):
+                q_len = q_seqlen[i]
+                kv_len = kv_seqlen[i]
+                q_seq = q[q_offset:q_offset + q_len].permute(1, 0, 2).unsqueeze(0)   # [1, H, q_len, C]
+                k_seq = k[kv_offset:kv_offset + kv_len].permute(1, 0, 2).unsqueeze(0) # [1, H, kv_len, C]
+                v_seq = v[kv_offset:kv_offset + kv_len].permute(1, 0, 2).unsqueeze(0) # [1, H, kv_len, Co]
+                out_seq = sdpa(q_seq, k_seq, v_seq)                                   # [1, H, q_len, Co]
+                out_seq = out_seq.squeeze(0).permute(1, 0, 2)                         # [q_len, H, Co]
+                outputs.append(out_seq)
+                q_offset += q_len
+                kv_offset += kv_len
+            out = torch.cat(outputs, dim=0)
+        else:  # naive
+            out = _naive_sdpa_varlen(q, k, v, q_seqlen, kv_seqlen)
     else:
         raise ValueError(f"Unknown attention module: {ATTN}")
     

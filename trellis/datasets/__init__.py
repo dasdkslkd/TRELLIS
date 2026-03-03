@@ -12,6 +12,12 @@ __attributes = {
     'TextConditionedSparseStructureLatent': 'sparse_structure_latent',
     'ImageConditionedSparseStructureLatent': 'sparse_structure_latent',
     
+    'CustomSparseStructureLatent': 'custom_sparse_structure',
+    'TextConditionedCustomSparseStructureLatent': 'custom_sparse_structure',
+    'ImageConditionedCustomSparseStructureLatent': 'custom_sparse_structure',
+    'PseudoColorImageConditionedMixin': 'custom_sparse_structure',
+    'PseudoColorImageConditionedCustomSparseStructureLatent': 'custom_sparse_structure',
+    
     'SLat': 'structured_latent',
     'TextConditionedSLat': 'structured_latent',
     'ImageConditionedSLat': 'structured_latent',
@@ -38,7 +44,14 @@ def __getattr__(name):
 # For Pylance
 if __name__ == '__main__':
     from .sparse_structure import SparseStructure
-    from .custom_sparse_structure import CustomSparseStructure
+    from .custom_sparse_structure import (
+        CustomSparseStructure,
+        CustomSparseStructureLatent,
+        TextConditionedCustomSparseStructureLatent,
+        ImageConditionedCustomSparseStructureLatent,
+        PseudoColorImageConditionedMixin,
+        PseudoColorImageConditionedCustomSparseStructureLatent,
+    )
     
     from .sparse_feat2render import SparseFeat2Render
     from .structured_latent2render import (
