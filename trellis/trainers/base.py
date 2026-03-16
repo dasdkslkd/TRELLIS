@@ -2,6 +2,7 @@ from abc import abstractmethod
 import os
 import time
 import json
+import copy
 
 import torch
 import torch.distributed as dist
@@ -42,6 +43,10 @@ class Trainer:
         finetune_ckpt=None,
         log_param_stats=False,
         prefetch_data=True,
+        num_workers=16,
+        persistent_workers=True,
+        best_metric=None,
+        best_metric_mode='max',
         i_print=1000,
         i_log=500,
         i_sample=10000,
@@ -65,6 +70,12 @@ class Trainer:
         self.fp16_scale_growth = fp16_scale_growth
         self.log_param_stats = log_param_stats
         self.prefetch_data = prefetch_data
+        self.num_workers = num_workers
+        self.persistent_workers = persistent_workers and num_workers > 0
+        self.best_metric_name = best_metric
+        self.best_metric_mode = best_metric_mode
+        self.best_metric_value = None
+        self.best_metric_step = None
         if self.prefetch_data:
             self._data_prefetched = None
 
@@ -114,6 +125,49 @@ class Trainer:
         if self.is_master:
             print('\n\nTrainer initialized.')
             print(self)
+
+    def _is_better_metric(self, value):
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        elif isinstance(value, np.generic):
+            value = value.item()
+        if self.best_metric_value is None:
+            return True
+        if self.best_metric_mode == 'min':
+            return value < self.best_metric_value
+        return value > self.best_metric_value
+
+    def _update_best_checkpoint(self, val_log):
+        if not self.is_master or self.best_metric_name is None:
+            return
+        if self.best_metric_name not in val_log:
+            return
+        metric_value = val_log[self.best_metric_name]
+        if isinstance(metric_value, torch.Tensor):
+            metric_value = metric_value.item()
+        elif isinstance(metric_value, np.generic):
+            metric_value = metric_value.item()
+        if not self._is_better_metric(metric_value):
+            return
+
+        self.best_metric_value = metric_value
+        self.best_metric_step = self.step
+        best_dir = os.path.join(self.output_dir, 'ckpts', 'best')
+        os.makedirs(best_dir, exist_ok=True)
+
+        self.save()
+
+        metric_info = {
+            'metric': self.best_metric_name,
+            'mode': self.best_metric_mode,
+            'value': metric_value,
+            'step': self.step,
+        }
+        with open(os.path.join(best_dir, 'best_metric.json'), 'w') as fp:
+            json.dump(metric_info, fp, indent=2)
+        with open(os.path.join(self.output_dir, 'best_metric.json'), 'w') as fp:
+            json.dump(metric_info, fp, indent=2)
+        print(f"New best {self.best_metric_name}: {metric_value:.6f} at step {self.step}")
             
     @property
     def device(self):
@@ -141,10 +195,10 @@ class Trainer:
             self.dataset,
             batch_size=self.batch_size_per_gpu,
             # num_workers=int(np.ceil(os.cpu_count() / torch.cuda.device_count())),
-            num_workers=16,
+            num_workers=self.num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True,
+            persistent_workers=self.persistent_workers,
             collate_fn=self.dataset.collate_fn if hasattr(self.dataset, 'collate_fn') else None,
             sampler=self.data_sampler,
         )
@@ -456,7 +510,8 @@ class Trainer:
                         self.writer.add_scalar(key, value, self.step)
                     log = []
                     
-                    self.validate()
+                    val_log = self.validate()
+                    self._update_best_checkpoint(val_log)
                     samples:dict = self.run_snapshot(num_samples=16, batch_size=4)
                     if 'recon' in samples:
                         train_miou = self.miou(samples['recon']['value'], samples['gt']['value'], thr=0.5)

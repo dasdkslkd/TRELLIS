@@ -1,0 +1,107 @@
+{
+    "_comment": "Two-Stage Sparse Structure VAE - Fusion360 joint warm-start with occupancy BCE",
+    "_description": "Warm-start from fusion360_stage1_bce_v3 and re-enable occupancy BCE during joint training to improve boundary precision.",
+    "models": {
+        "encoder": {
+            "name": "SparseStructureEncoder",
+            "args": {
+                "in_channels": 80,
+                "latent_channels": 8,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [32, 128, 512],
+                "use_fp16": false
+            }
+        },
+        "decoder_stage1": {
+            "name": "SparseStructureDecoder",
+            "args": {
+                "out_channels": 8,
+                "latent_channels": 8,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [512, 128, 32],
+                "use_fp16": false
+            }
+        },
+        "decoder_stage2": {
+            "name": "SparseStructureCondDecoder",
+            "args": {
+                "out_channels": 72,
+                "latent_channels": 8,
+                "cond_channels": 8,
+                "cond_latent_channels": 32,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [512, 128, 32],
+                "use_fp16": false
+            }
+        }
+    },
+    "dataset": {
+        "name": "CustomSparseStructure",
+        "args": {
+            "resolution": 64
+        }
+    },
+    "val_dataset": {
+        "name": "CustomSparseStructure",
+        "args": {
+            "resolution": 64
+        }
+    },
+    "trainer": {
+        "name": "TwoStageSparseStructureVaeTrainer",
+        "args": {
+            "training_mode": "joint",
+            "stage1_channels": 8,
+            "stage2_channels": 72,
+            "lambda_dice": 2.0,
+            "lambda_bce_occ": 1.0,
+            "occ_bce_pos_weight": 16.0,
+            "lambda_ce": 2.0,
+            "lambda_mse": 0.25,
+            "lambda_kl": 0.0002,
+            "detach_stage1_for_stage2": true,
+            "stage2_cond_source": "predicted",
+            "max_steps": 3000,
+            "batch_size_per_gpu": 1,
+            "batch_split": 1,
+            "num_workers": 0,
+            "persistent_workers": false,
+            "best_metric": "miou_occ",
+            "best_metric_mode": "max",
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 0.0003,
+                    "weight_decay": 0.0
+                }
+            },
+            "lr_scheduler": {
+                "name": "CosineAnnealingLR",
+                "args": {
+                    "T_max": 3000,
+                    "eta_min": 5e-05
+                }
+            },
+            "finetune_ckpt": {
+                "encoder": "/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/fusion360_stage1_bce_v3/ckpts/encoder_step0001500.pt",
+                "decoder_stage1": "/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/fusion360_stage1_bce_v3/ckpts/decoder_stage1_step0001500.pt"
+            },
+            "ema_rate": [0.9999],
+            "fp16_mode": null,
+            "fp16_scale_growth": 0.001,
+            "grad_clip": {
+                "name": "AdaptiveGradClipper",
+                "args": {
+                    "max_norm": 0.5,
+                    "clip_percentile": 95
+                }
+            },
+            "i_log": 50,
+            "i_sample": 300,
+            "i_save": 1000
+        }
+    }
+}

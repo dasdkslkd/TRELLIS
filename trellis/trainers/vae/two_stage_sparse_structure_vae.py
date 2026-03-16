@@ -40,6 +40,11 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
         stage1_channels (int): Number of channels for stage 1 (default 8).
         stage2_channels (int): Number of channels for stage 2 (default 75).
         lambda_dice (float): Weight for dice loss (channel 0).
+        occupancy_overlap_loss (str): Overlap loss for occupancy channel, "dice" or "tversky".
+        tversky_alpha (float): False-positive weight used by Tversky loss.
+        tversky_beta (float): False-negative weight used by Tversky loss.
+        lambda_bce_occ (float): Weight for occupancy BCE loss (channel 0).
+        occ_bce_pos_weight (float): Positive class weight for occupancy BCE.
         lambda_ce (float): Weight for cross-entropy loss (channels 1-7).
         lambda_mse (float): Weight for MSE loss (channels 8-82).
         lambda_kl (float): Weight for KL divergence.
@@ -54,6 +59,11 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
         stage1_channels: int = 8,
         stage2_channels: int = 75,
         lambda_dice: float = 1.0,
+        occupancy_overlap_loss: str = 'dice',
+        tversky_alpha: float = 0.5,
+        tversky_beta: float = 0.5,
+        lambda_bce_occ: float = 0.0,
+        occ_bce_pos_weight: float = 1.0,
         lambda_ce: float = 1.0,
         lambda_mse: float = 1.0,
         lambda_kl: float = 1e-3,
@@ -65,6 +75,11 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
         self.stage1_channels = stage1_channels
         self.stage2_channels = stage2_channels
         self.lambda_dice = lambda_dice
+        self.occupancy_overlap_loss = occupancy_overlap_loss
+        self.tversky_alpha = tversky_alpha
+        self.tversky_beta = tversky_beta
+        self.lambda_bce_occ = lambda_bce_occ
+        self.occ_bce_pos_weight = occ_bce_pos_weight
         self.lambda_ce = lambda_ce
         self.lambda_mse = lambda_mse
         self.lambda_kl = lambda_kl
@@ -127,11 +142,23 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
         terms = {}
 
         # --- Dice loss for channel 0 (occupancy) ---
-        occ_pred = torch.sigmoid(logits[:, 0:1])
+        occ_logits = logits[:, 0:1]
+        occ_pred = torch.sigmoid(occ_logits)
         occ_gt = ss[:, 0:1].float()
         intersection = (occ_pred * occ_gt).sum()
-        dice_loss = 1.0 - (2.0 * intersection + 1.0) / (occ_pred.sum() + occ_gt.sum() + 1.0)
+        if self.occupancy_overlap_loss == 'dice':
+            dice_loss = 1.0 - (2.0 * intersection + 1.0) / (occ_pred.sum() + occ_gt.sum() + 1.0)
+        elif self.occupancy_overlap_loss == 'tversky':
+            false_pos = (occ_pred * (1.0 - occ_gt)).sum()
+            false_neg = ((1.0 - occ_pred) * occ_gt).sum()
+            dice_loss = 1.0 - (intersection + 1.0) / (
+                intersection + self.tversky_alpha * false_pos + self.tversky_beta * false_neg + 1.0
+            )
+        else:
+            raise ValueError(f'Invalid occupancy_overlap_loss: {self.occupancy_overlap_loss}')
         terms['dice'] = dice_loss
+        pos_weight = torch.tensor(self.occ_bce_pos_weight, device=logits.device, dtype=logits.dtype)
+        terms['bce_occ'] = F.binary_cross_entropy_with_logits(occ_logits, occ_gt, pos_weight=pos_weight)
 
         # --- Cross-entropy loss for channels 1-7 (one-hot categories) ---
         # Only compute on occupied voxels (where GT occ > 0.5)
@@ -208,8 +235,10 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
             stage1_logits = self.training_models['decoder_stage1'](z)
             s1_losses = self._compute_stage1_loss(stage1_logits, ss)
             terms['dice'] = s1_losses['dice']
+            terms['bce_occ'] = s1_losses['bce_occ']
             terms['ce'] = s1_losses['ce']
             terms['loss'] = terms['loss'] + self.lambda_dice * terms['dice']
+            terms['loss'] = terms['loss'] + self.lambda_bce_occ * terms['bce_occ']
             terms['loss'] = terms['loss'] + self.lambda_ce * terms['ce']
             terms['loss'] = terms['loss'] + self.lambda_kl * terms['kl']
 
@@ -218,6 +247,7 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
             with torch.no_grad():
                 stage1_logits = self.training_models['decoder_stage1'](z)
             terms['dice'] = torch.tensor(0.0, device=ss.device)
+            terms['bce_occ'] = torch.tensor(0.0, device=ss.device)
             terms['ce'] = torch.tensor(0.0, device=ss.device)
 
         # ==================== Stage 2 ====================
@@ -359,6 +389,10 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
         total_miou = 0.0
         total_miou_occ = 0.0
         total_mse = 0.0
+        total_occ_precision = 0.0
+        total_occ_recall = 0.0
+        total_pred_occ_ratio = 0.0
+        total_gt_occ_ratio = 0.0
         num_batches = 0
 
         for data in dataloader:
@@ -373,8 +407,17 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
 
             batch_miou = self.miou(stage1_activated, ss, thr=0.5)
             batch_miou_occ = self.miou_occ(stage1_activated[:, :1], ss[:, :1], thr=0.5)
+            pred_occ = stage1_activated[:, :1] > 0.5
+            gt_occ = ss[:, :1] > 0.5
+            inter = (pred_occ & gt_occ).sum().float()
+            pred_pos = pred_occ.sum().float()
+            gt_pos = gt_occ.sum().float()
             total_miou += batch_miou
             total_miou_occ += batch_miou_occ
+            total_occ_precision += (inter / pred_pos.clamp(min=1)).item()
+            total_occ_recall += (inter / gt_pos.clamp(min=1)).item()
+            total_pred_occ_ratio += pred_pos.div(pred_occ.numel()).item()
+            total_gt_occ_ratio += gt_pos.div(gt_occ.numel()).item()
 
             # Stage 2
             if 'decoder_stage2' in self.models:
@@ -390,10 +433,18 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
         avg_miou = total_miou / max(num_batches, 1)
         avg_miou_occ = total_miou_occ / max(num_batches, 1)
         avg_mse = total_mse / max(num_batches, 1)
+        avg_occ_precision = total_occ_precision / max(num_batches, 1)
+        avg_occ_recall = total_occ_recall / max(num_batches, 1)
+        avg_pred_occ_ratio = total_pred_occ_ratio / max(num_batches, 1)
+        avg_gt_occ_ratio = total_gt_occ_ratio / max(num_batches, 1)
 
         if self.is_master:
             print(f'Validation mIoU: {avg_miou:.4f}')
             print(f'Validation mIoU_occ: {avg_miou_occ:.4f}')
+            print(f'Validation occ_precision: {avg_occ_precision:.4f}')
+            print(f'Validation occ_recall: {avg_occ_recall:.4f}')
+            print(f'Validation pred_occ_ratio: {avg_pred_occ_ratio:.4f}')
+            print(f'Validation gt_occ_ratio: {avg_gt_occ_ratio:.4f}')
             if 'decoder_stage2' in self.models:
                 print(f'Validation MSE (stage2): {avg_mse:.6f}')
 
@@ -403,5 +454,9 @@ class TwoStageSparseStructureVaeTrainer(BasicTrainer):
         return {
             'miou': avg_miou,
             'miou_occ': avg_miou_occ,
+            'occ_precision': avg_occ_precision,
+            'occ_recall': avg_occ_recall,
+            'pred_occ_ratio': avg_pred_occ_ratio,
+            'gt_occ_ratio': avg_gt_occ_ratio,
             'mse_stage2': avg_mse,
         }
