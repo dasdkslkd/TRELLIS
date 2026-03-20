@@ -49,12 +49,40 @@ DEFAULT_EXPERIMENTS: Dict[str, ExperimentSpec] = {
         val_data='/public/home/pb22000140/datasets/ABC1M_voxelized_brep_64_80ch_stage1_split/val',
         output_dir='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/abc1m_stage1_v2',
     ),
+    'abc1m_v5': ExperimentSpec(
+        name='abc1m_v5',
+        title='ABC-1M Stage1 v5',
+        config_path='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/configs/vae/ss_stage1_abc1m_80ch_v5.json',
+        val_data='/public/home/pb22000140/datasets/ABC1M_voxelized_brep_64_80ch_stage1_split_v2/val',
+        output_dir='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/abc1m_stage1_v5',
+    ),
+    'abc1m_v8': ExperimentSpec(
+        name='abc1m_v8',
+        title='ABC-1M Stage1 v8',
+        config_path='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/configs/vae/ss_stage1_abc1m_80ch_v8.json',
+        val_data='/public/home/pb22000140/datasets/ABC1M_voxelized_brep_64_80ch_stage1_split_v2/val',
+        output_dir='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/abc1m_stage1_v8',
+    ),
+    'abc1m_v5_pruned': ExperimentSpec(
+        name='abc1m_v5_pruned',
+        title='ABC-1M Stage1 v5 Pruned',
+        config_path='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/configs/vae/ss_stage1_abc1m_80ch_v5.json',
+        val_data='/public/home/pb22000140/datasets/ABC1M_voxelized_brep_64_80ch_stage1_split_v2/val',
+        output_dir='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/abc1m_stage1_v5_pruned',
+    ),
     'mixed': ExperimentSpec(
         name='mixed',
         title='Fusion360 + ABC-1M Mixed Stage1 v1',
         config_path='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/configs/vae/ss_stage1_mix_fusion360_abc1m_80ch_v1.json',
         val_data='/public/home/pb22000140/datasets/Fusion360_seg_voxelized_brep_64_v2_trellis_split/val,/public/home/pb22000140/datasets/ABC1M_voxelized_brep_64_80ch_stage1_split/val',
         output_dir='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/mix_fusion360_abc1m_stage1_v1',
+    ),
+    'mixed_v2': ExperimentSpec(
+        name='mixed_v2',
+        title='Fusion360 + ABC-1M Mixed Stage1 v2',
+        config_path='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/configs/vae/ss_stage1_mix_fusion360_abc1m_80ch_v2.json',
+        val_data='/public/home/pb22000140/datasets/Fusion360_seg_voxelized_brep_64_v2_trellis_split/val,/public/home/pb22000140/datasets/ABC1M_voxelized_brep_64_80ch_stage1_split_v2/val',
+        output_dir='/public/home/pb22000140/TRELLIS-new/TRELLIS-main/outputs/vae/mix_fusion360_abc1m_stage1_v2',
     ),
 }
 

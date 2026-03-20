@@ -1,0 +1,90 @@
+{
+    "_comment": "Sparse Structure VAE Stage1 higher-pos-weight training from scratch on repaired ABC-1M voxelized BRep v2 split",
+    "_description": "Train stage1 VAE independently on repaired ABC-1M v2 with a stronger occupancy BCE positive weight to probe whether the v5 baseline severely underweights sparse occupied voxels.",
+    "models": {
+        "encoder": {
+            "name": "SparseStructureEncoder",
+            "args": {
+                "in_channels": 80,
+                "latent_channels": 8,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [32, 128, 512],
+                "use_fp16": false
+            }
+        },
+        "decoder_stage1": {
+            "name": "SparseStructureDecoder",
+            "args": {
+                "out_channels": 8,
+                "latent_channels": 8,
+                "num_res_blocks": 2,
+                "num_res_blocks_middle": 2,
+                "channels": [512, 128, 32],
+                "use_fp16": false
+            }
+        }
+    },
+    "dataset": {
+        "name": "CustomSparseStructure",
+        "args": {
+            "resolution": 64
+        }
+    },
+    "val_dataset": {
+        "name": "CustomSparseStructure",
+        "args": {
+            "resolution": 64
+        }
+    },
+    "trainer": {
+        "name": "TwoStageSparseStructureVaeTrainer",
+        "args": {
+            "training_mode": "stage1",
+            "stage1_channels": 8,
+            "stage2_channels": 72,
+            "lambda_dice": 1.8,
+            "lambda_bce_occ": 1.0,
+            "occ_bce_pos_weight": 20.0,
+            "lambda_ce": 2.0,
+            "lambda_mse": 0.0,
+            "lambda_kl": 0.00002,
+            "detach_stage1_for_stage2": true,
+            "stage2_cond_source": "predicted",
+            "max_steps": 4000,
+            "batch_size_per_gpu": 1,
+            "batch_split": 1,
+            "num_workers": 0,
+            "persistent_workers": false,
+            "best_metric": "miou_occ",
+            "best_metric_mode": "max",
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 0.00005,
+                    "weight_decay": 0.0
+                }
+            },
+            "lr_scheduler": {
+                "name": "CosineAnnealingLR",
+                "args": {
+                    "T_max": 4000,
+                    "eta_min": 0.000005
+                }
+            },
+            "ema_rate": [0.9999],
+            "fp16_mode": null,
+            "fp16_scale_growth": 0.001,
+            "grad_clip": {
+                "name": "AdaptiveGradClipper",
+                "args": {
+                    "max_norm": 0.5,
+                    "clip_percentile": 95
+                }
+            },
+            "i_log": 50,
+            "i_sample": 400,
+            "i_save": 500
+        }
+    }
+}

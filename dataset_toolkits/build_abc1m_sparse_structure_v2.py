@@ -6,7 +6,7 @@ import json
 import math
 import os
 import shutil
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -45,6 +45,13 @@ SCAN_COLUMNS = [
     "err",
 ]
 PREFILTER_REASON_PREFIX = "skip_"
+NEIGHBOR_OFFSETS_26 = [
+    (dx, dy, dz)
+    for dx in (-1, 0, 1)
+    for dy in (-1, 0, 1)
+    for dz in (-1, 0, 1)
+    if not (dx == 0 and dy == 0 and dz == 0)
+]
 
 
 def decode_npy_blob(blob: bytes) -> np.ndarray:
@@ -391,6 +398,104 @@ def validate_voxel_inputs(row: Dict[str, object]) -> Optional[str]:
     return None
 
 
+def build_occupied_flat_indices_from_row(
+    row: Dict[str, object],
+    resolution: int,
+) -> np.ndarray:
+    face_ncs = decode_npy_blob(row["face_points_normalized"])
+    face_mask = decode_npy_blob(row["face_mask"])
+    face_types = decode_npy_blob(row["face_types"])
+    face_bbox = decode_npy_blob(row["face_bbox_world"])
+
+    face_points = batch_ncs2wcs(face_ncs, face_bbox)
+    voxel_point_store = build_face_point_store(face_points, face_mask, face_types, resolution)
+    if not voxel_point_store:
+        return np.zeros((0,), dtype=np.int64)
+    return np.asarray(sorted(voxel_point_store.keys()), dtype=np.int64)
+
+
+def compute_component_metrics(flat_indices: np.ndarray, resolution: int) -> Dict[str, float]:
+    flat_indices = np.asarray(flat_indices, dtype=np.int64)
+    total_voxels = int(flat_indices.shape[0])
+    if total_voxels == 0:
+        return {
+            "component_count": 0,
+            "largest_component_size": 0,
+            "largest_component_ratio": 0.0,
+            "small_component_ratio": 0.0,
+            "total_voxels": 0,
+        }
+
+    coords = flat_to_coords(flat_indices, resolution)
+    occupied = {tuple(coord) for coord in coords.tolist()}
+    visited = set()
+    component_sizes: List[int] = []
+
+    for coord in occupied:
+        if coord in visited:
+            continue
+        queue = deque([coord])
+        visited.add(coord)
+        size = 0
+        while queue:
+            x, y, z = queue.popleft()
+            size += 1
+            for dx, dy, dz in NEIGHBOR_OFFSETS_26:
+                nxt = (x + dx, y + dy, z + dz)
+                if nxt in occupied and nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        component_sizes.append(size)
+
+    component_sizes.sort(reverse=True)
+    largest_component_size = component_sizes[0]
+    largest_component_ratio = largest_component_size / float(total_voxels)
+    return {
+        "component_count": len(component_sizes),
+        "largest_component_size": largest_component_size,
+        "largest_component_ratio": largest_component_ratio,
+        "small_component_ratio": 1.0 - largest_component_ratio,
+        "total_voxels": total_voxels,
+    }
+
+
+def should_run_quality_filter(args: argparse.Namespace) -> bool:
+    return (
+        args.max_voxel_components > 0
+        or args.max_small_component_ratio < 1.0
+        or args.low_ratio_component_count_threshold > 0
+    )
+
+
+def build_quality_reason(
+    row: Dict[str, object],
+    resolution: int,
+    max_voxel_components: int,
+    max_small_component_ratio: float,
+    low_ratio_min: float,
+    low_ratio_max: float,
+    low_ratio_component_count_threshold: int,
+) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
+    occupied_flats = build_occupied_flat_indices_from_row(row, resolution)
+    metrics = compute_component_metrics(occupied_flats, resolution)
+    if metrics["total_voxels"] == 0:
+        return "empty_voxel_grid", metrics
+    if max_voxel_components > 0 and metrics["component_count"] > max_voxel_components:
+        return "too_many_voxel_components", metrics
+    if (
+        low_ratio_component_count_threshold > 0
+        and low_ratio_min <= metrics["largest_component_ratio"] <= low_ratio_max
+        and metrics["component_count"] >= low_ratio_component_count_threshold
+    ):
+        return "low_largest_component_ratio", metrics
+    if (
+        max_small_component_ratio < 1.0
+        and metrics["small_component_ratio"] > max_small_component_ratio
+    ):
+        return "too_many_small_components", metrics
+    return None, metrics
+
+
 def build_sparse_tensor_from_row(
     row: Dict[str, object],
     resolution: int,
@@ -428,6 +533,12 @@ def make_parser() -> argparse.ArgumentParser:
     scan.add_argument("--bit", type=int, default=10)
     scan.add_argument("--max-edge", type=int, default=1000)
     scan.add_argument("--max-parquets", type=int, default=0)
+    scan.add_argument("--quality-resolution", type=int, default=64)
+    scan.add_argument("--max-voxel-components", type=int, default=0)
+    scan.add_argument("--max-small-component-ratio", type=float, default=1.0)
+    scan.add_argument("--low-ratio-min", type=float, default=0.9)
+    scan.add_argument("--low-ratio-max", type=float, default=0.95)
+    scan.add_argument("--low-ratio-component-count-threshold", type=int, default=16)
 
     select = subparsers.add_parser("finalize-selection", help="Combine shard scans and choose the build list")
     select.add_argument("--scan-root", type=str, required=True)
@@ -445,6 +556,11 @@ def make_parser() -> argparse.ArgumentParser:
     build.add_argument("--n-sample-points", type=int, default=24)
     build.add_argument("--bit", type=int, default=10)
     build.add_argument("--max-edge", type=int, default=1000)
+    build.add_argument("--max-voxel-components", type=int, default=0)
+    build.add_argument("--max-small-component-ratio", type=float, default=1.0)
+    build.add_argument("--low-ratio-min", type=float, default=0.9)
+    build.add_argument("--low-ratio-max", type=float, default=0.95)
+    build.add_argument("--low-ratio-component-count-threshold", type=int, default=16)
 
     finalize = subparsers.add_parser("finalize-dataset", help="Create the final train/val dataset from cached tensors")
     finalize.add_argument("--selected-manifest", type=str, required=True)
@@ -497,12 +613,28 @@ def run_scan(args: argparse.Namespace) -> None:
                         stats[PREFILTER_REASON_PREFIX + validation_reason] += 1
                         continue
 
+                    if should_run_quality_filter(args):
+                        quality_reason, quality_metrics = build_quality_reason(
+                            row,
+                            resolution=args.quality_resolution,
+                            max_voxel_components=args.max_voxel_components,
+                            max_small_component_ratio=args.max_small_component_ratio,
+                            low_ratio_min=args.low_ratio_min,
+                            low_ratio_max=args.low_ratio_max,
+                            low_ratio_component_count_threshold=args.low_ratio_component_count_threshold,
+                        )
+                        if quality_reason is not None:
+                            stats[PREFILTER_REASON_PREFIX + quality_reason] += 1
+                            continue
+
                     record = {
                         "stem": str(row["stem"]),
                         "parquet_path": parquet_path,
                         "parquet_index": parquet_index,
                         "row_index": row_offset + batch_row,
                     }
+                    if should_run_quality_filter(args) and quality_metrics is not None:
+                        record["quality_metrics"] = quality_metrics
                     write_jsonl(records_path, record)
                     stats["candidate"] += 1
 
@@ -648,18 +780,6 @@ def run_build(args: argparse.Namespace) -> None:
             stats["requested"] += 1
             stem = record["stem"]
             cache_path = data_dir / f"{record['rank']:06d}_{stem}.pt"
-            if cache_path.exists():
-                write_jsonl(
-                    build_records_path,
-                    {
-                        "rank": record["rank"],
-                        "stem": stem,
-                        "status": "cached",
-                        "cache_path": str(cache_path),
-                    },
-                )
-                stats["cached"] += 1
-                continue
 
             reason = build_prefilter_reason(row, bit=args.bit, max_edge=args.max_edge)
             if reason is not None:
@@ -673,6 +793,57 @@ def run_build(args: argparse.Namespace) -> None:
                     },
                 )
                 stats[PREFILTER_REASON_PREFIX + reason] += 1
+                continue
+
+            validation_reason = validate_voxel_inputs(row)
+            if validation_reason is not None:
+                write_jsonl(
+                    build_records_path,
+                    {
+                        "rank": record["rank"],
+                        "stem": stem,
+                        "status": "skip_prefilter",
+                        "reason": validation_reason,
+                    },
+                )
+                stats[PREFILTER_REASON_PREFIX + validation_reason] += 1
+                continue
+
+            if should_run_quality_filter(args):
+                quality_reason, quality_metrics = build_quality_reason(
+                    row,
+                    resolution=args.resolution,
+                    max_voxel_components=args.max_voxel_components,
+                    max_small_component_ratio=args.max_small_component_ratio,
+                    low_ratio_min=args.low_ratio_min,
+                    low_ratio_max=args.low_ratio_max,
+                    low_ratio_component_count_threshold=args.low_ratio_component_count_threshold,
+                )
+                if quality_reason is not None:
+                    write_jsonl(
+                        build_records_path,
+                        {
+                            "rank": record["rank"],
+                            "stem": stem,
+                            "status": "skip_quality",
+                            "reason": quality_reason,
+                            "quality_metrics": quality_metrics,
+                        },
+                    )
+                    stats[PREFILTER_REASON_PREFIX + quality_reason] += 1
+                    continue
+
+            if cache_path.exists():
+                cached_record = {
+                    "rank": record["rank"],
+                    "stem": stem,
+                    "status": "cached",
+                    "cache_path": str(cache_path),
+                }
+                if should_run_quality_filter(args) and quality_metrics is not None:
+                    cached_record["quality_metrics"] = quality_metrics
+                write_jsonl(build_records_path, cached_record)
+                stats["cached"] += 1
                 continue
 
             try:
@@ -715,6 +886,11 @@ def run_build(args: argparse.Namespace) -> None:
                     "status": "success",
                     "cache_path": str(cache_path),
                     "nnz": int(sparse._nnz()),
+                    **(
+                        {"quality_metrics": quality_metrics}
+                        if should_run_quality_filter(args) and quality_metrics is not None
+                        else {}
+                    ),
                 },
             )
             stats["success"] += 1
